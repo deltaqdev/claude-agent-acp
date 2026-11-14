@@ -35,6 +35,9 @@
  *   `agentCapabilities.sessionCapabilities.title`, which origin/main did not:
  *   the agent now serves `session/set_title`.
  * - The `initialize` response also advertises
+ *   `agentCapabilities._meta["sh.rexa/sessionRewind"]`, which origin/main did
+ *   not: Rexa's fork serves `_sh.rexa/session/rewind`.
+ * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
  *   not: the agent now serves `session/options` and takes `configOptions` on
  *   session setup requests.
@@ -266,6 +269,22 @@ function withoutAuthStatusCapability(record: Recorded): Recorded {
   } as Recorded;
 }
 
+/** `record` without `agentCapabilities._meta["sh.rexa/sessionRewind"]`, when it is an `initialize` response. */
+function withoutSessionRewindCapability(record: Recorded): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const meta = agent?._meta as Json | undefined;
+  if (!meta || !("sh.rexa/sessionRewind" in meta)) return record;
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      agentCapabilities: { ...agent, _meta: without(meta, "sh.rexa/sessionRewind") },
+    },
+  } as Recorded;
+}
+
 /**
  * Returns the differences between the baseline and the current traffic that
  * the compatibility rule does not allow. An empty list means compatible.
@@ -281,8 +300,10 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     });
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
-      withoutAuthStatusCapability(
-        withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+      withoutSessionRewindCapability(
+        withoutAuthStatusCapability(
+          withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+        ),
       ),
     ),
   );

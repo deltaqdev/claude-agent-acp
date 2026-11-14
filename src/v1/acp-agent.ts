@@ -193,6 +193,15 @@ import {
 } from "../mcp-oauth.js";
 import { forkSession } from "../fork-session.js";
 import {
+  parseRewindSessionRequest,
+  SESSION_REWIND_METHOD,
+  sessionRewindCapability,
+  SessionRewinds,
+  type RewindCut,
+  type RewindSessionRequest,
+  type RewindSessionResponse,
+} from "../session-rewind.js";
+import {
   clientSystemPrompt,
   sessionSystemPrompt,
   SYSTEM_PROMPT_CAPABILITY,
@@ -1848,6 +1857,8 @@ export class ClaudeAcpAgent {
   private providerUpdate: Promise<void> | null = null;
   /** Per session: queue that runs mode/config changes and query restarts one at a time. */
   private readonly configurationChanges = new Map<string, Promise<void>>();
+  /** `_sh.rexa/session/rewind` (see `session-rewind.ts`). */
+  private readonly sessionRewinds = new SessionRewinds<Session>();
   private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
   /** The connection's `authStatus` state and pushes, connection-scoped like
    *  `authenticate`/`logout`. */
@@ -2055,6 +2066,7 @@ export class ClaudeAcpAgent {
           // never a status payload. The state itself travels on
           // `_auth/status_update`; there is nothing for a client to ask for.
           authStatus: authStatusCapability(),
+          ...sessionRewindCapability(),
         },
         promptCapabilities: {
           image: true,
@@ -2293,6 +2305,27 @@ export class ClaudeAcpAgent {
    *  {@link sessionIndex.SessionIndexConnection.forking}). */
   forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
     return this.sessionIndex.forking(sourceId, fork);
+  }
+
+  /** `_sh.rexa/session/rewind`: rewinds the live query in place, or restarts it at the cut (see `session-rewind.ts`). */
+  rewindSession(params: RewindSessionRequest): Promise<RewindSessionResponse> {
+    return this.sessionRewinds.rewind(params, {
+      ready: async () => {
+        while (this.providerUpdate) await this.providerUpdate;
+      },
+      session: (sessionId) => this.sessions[sessionId],
+      isWorking: (sessionId, session) => this.claudeIsWorking(sessionId, session),
+      serialize: (sessionId, change) => this.serializeConfigurationChange(sessionId, change),
+      restart: async (sessionId, session, cut) => {
+        if (!session.creationParams) {
+          throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+        }
+        await this.replaceSessionQuery(sessionId, session, session.creationParams, cut);
+        const restarted = this.sessions[sessionId];
+        return restarted && restarted !== session && !restarted.tornDown ? restarted : undefined;
+      },
+      logger: this.logger,
+    });
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -2634,6 +2667,9 @@ export class ClaudeAcpAgent {
     if (origin === "client") this.sessions[params.sessionId]?.idleCompaction?.disarm("prompt");
     const received = ++this.promptsReceived;
     while (this.providerUpdate) await this.providerUpdate;
+    // A prompt sent during a rewind runs on the query the rewind starts.
+    const rewind = this.sessionRewinds.inFlight(params.sessionId);
+    if (rewind) await rewind;
     let session = this.sessions[params.sessionId];
     if (!session) {
       throw RequestError.sessionNotFound(params.sessionId);
@@ -3015,14 +3051,20 @@ export class ClaudeAcpAgent {
       permissionMode?: PermissionMode;
       resumedModelHint?: string | Promise<string | undefined>;
       replacingSession?: Session;
+      cut?: RewindCut;
     },
   ): Promise<NewSessionResponse> {
     try {
       return await this.createSession(params, { resume: sessionId, ...options });
     } catch (error) {
-      if (!(
-        error instanceof RequestError && error.code === RequestError.sessionNotFound(sessionId).code
-      )) {
+      // A rewind's session has a stored conversation: a fresh one would lose it.
+      if (
+        options.cut ||
+        !(
+          error instanceof RequestError &&
+          error.code === RequestError.sessionNotFound(sessionId).code
+        )
+      ) {
         throw error;
       }
       this.logger.log(
@@ -9967,6 +10009,8 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
       /** A close of this session during startup cancels registration of its replacement. */
       replacingSession?: Session;
+      /** With `resume`: the query loads the conversation only up to this cut (a rewind). */
+      cut?: RewindCut;
       /**
        * `session/options`: the query answers with the modes and config options
        * and closes. No session is registered, and Claude Code stores nothing
@@ -10364,6 +10408,7 @@ export class ClaudeAcpAgent {
         ],
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
+      ...(creationOpts.resume !== undefined && creationOpts.cut),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
       ...(creationOpts.optionsOnly ? { persistSession: false } : {}),
       abortController,
@@ -10805,11 +10850,14 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Recreates the session's query and restores its choices and reported MCP servers, unless it was closed meanwhile. */
+  /** Recreates the session's query and restores its choices and reported MCP
+   *  servers, unless it was closed meanwhile. With `cut`, the new query resumes
+   *  the conversation only up to it (a rewind). */
   private async replaceSessionQuery(
     sessionId: string,
     session: Session,
     creationParams: NewSessionRequest,
+    cut?: RewindCut,
   ): Promise<void> {
     this.closeQueryStream(session);
     // Keep the old record visible so closeSession and dispose can mark it torn down.
@@ -10817,6 +10865,7 @@ export class ClaudeAcpAgent {
     await this.recreateLiveSession(withoutEffort(creationParams), sessionId, {
       permissionMode: session.modes.currentModeId as PermissionMode,
       replacingSession: session,
+      ...(cut ? { cut } : {}),
     });
     const recreated = this.sessions[sessionId];
     if (!recreated || recreated.tornDown) return;
@@ -11304,6 +11353,11 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<RewindSessionRequest, RewindSessionResponse>(
+      SESSION_REWIND_METHOD,
+      { parse: parseRewindSessionRequest },
+      (ctx) => agent.rewindSession(ctx.params),
     );
   return sessionIndex.onSessionIndexRequests(app, () => agent);
 }

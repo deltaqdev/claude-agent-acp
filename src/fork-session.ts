@@ -168,7 +168,7 @@ function resolveFromFullHistory(
  * `Error("Session <id> not found")`, and both throw
  * `"Invalid sessionId: <id>"` for an id that is not a UUID.
  */
-function isUnknownSessionError(error: unknown, sessionId: string): boolean {
+export function isUnknownSessionError(error: unknown, sessionId: string): boolean {
   if (!(error instanceof Error)) return false;
   return (
     error.message === `Session ${sessionId} not found` ||

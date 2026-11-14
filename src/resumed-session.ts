@@ -9,6 +9,7 @@ import { access, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { isCompactSummaryMessage } from "./context-compaction.js";
 import { claudeConfigDir } from "./paths.js";
+import { endAtLeaf, rewoundLeafOfTranscript } from "./rewound-leaf.js";
 import { SessionTiming } from "./session-timing.js";
 
 /** The size of one backward read of a transcript. */
@@ -98,6 +99,10 @@ export async function readResumedSession(
  * summary, and the relinked boundary then leads from them back to the summary:
  * the chain loops and ends there. Without it, the kept messages stay where
  * they were said, before the boundary.
+ *
+ * After a rewind of Claude Code and before the next prompt, `messages` still
+ * ends with the discarded messages: the result ends at the message the rewind
+ * kept (see `RewoundLeafScan`).
  */
 export async function readHistoryAcrossCompactions(
   sessionId: string,
@@ -105,6 +110,7 @@ export async function readHistoryAcrossCompactions(
   logger?: ResumeLogger,
   dir?: string,
 ): Promise<SessionMessage[]> {
+  messages = await withoutRewoundMessages(sessionId, messages, logger);
   if (!isCompactSummaryMessage(messages[0])) return messages;
   try {
     const entries = (await loadFullSessionHistory(sessionId, dir)).map(linkCompactBoundary);
@@ -126,6 +132,22 @@ export async function readHistoryAcrossCompactions(
       `Failed to read the history before the last compaction of session ${sessionId}:`,
       error,
     );
+    return messages;
+  }
+}
+
+/** `messages` up to the leaf a rewind of Claude Code left, when the transcript has one. */
+async function withoutRewoundMessages(
+  sessionId: string,
+  messages: SessionMessage[],
+  logger?: ResumeLogger,
+): Promise<SessionMessage[]> {
+  try {
+    const filePath = await findTranscript(sessionId);
+    const leaf = filePath ? await rewoundLeafOfTranscript(filePath) : undefined;
+    return leaf ? endAtLeaf(messages, leaf) : messages;
+  } catch (error) {
+    logger?.error(`Failed to read the rewind of session ${sessionId}:`, error);
     return messages;
   }
 }
