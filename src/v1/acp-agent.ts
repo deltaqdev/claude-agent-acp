@@ -6144,6 +6144,21 @@ export class ClaudeAcpAgent {
                     );
                   }
                 }
+                // No prompt waits on this cycle, so its error goes out as a
+                // session-scoped failure: the assistant error text it stands
+                // for was withheld from a `sessionFailure` client above.
+                const autonomousEnd = resultEnd(message);
+                if (
+                  "error" in autonomousEnd &&
+                  !autonomousEnd.loginRequired &&
+                  !session.cancelled &&
+                  !isAbortedResult(message)
+                ) {
+                  await publishSessionFailure(
+                    providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
+                    { turnScoped: false, title: lastAssistantFailureTitle ?? autonomousEnd.error },
+                  );
+                }
                 // CLI 2.1.274+ answers background-task completions that were
                 // already queued with ONE model call: every queued
                 // notification still gets its own result, but all except the

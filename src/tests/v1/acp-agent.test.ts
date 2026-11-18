@@ -11885,6 +11885,55 @@ describe("stop reason propagation", () => {
     },
   );
 
+  it("publishes a background cycle's usage limit as a session-scoped failure", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, airSessionFailureCapabilities);
+    const limit = createUsageLimitAssistantError();
+    const title = (limit.message.content[0] as { text: string }).text;
+    const backgroundResult = {
+      ...createResultMessage({
+        subtype: "success",
+        stop_reason: "stop_sequence",
+        is_error: true,
+        result: title,
+      }),
+      origin: { kind: "task-notification" },
+    };
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        yield limit;
+        yield backgroundResult;
+        const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(userMessage);
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+
+    expect(failures).toEqual([
+      expect.objectContaining({ category: "limit", severity: "error", title, actions: [] }),
+    ]);
+    expect(failures[0].id).toContain(":session-error:");
+    expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
+    expect(response.stopReason).toBe("end_turn");
+    expect(sessionFailureFromResponse(response)).toBeUndefined();
+  });
+
   it("updates an api retry warning into the terminal failure", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
